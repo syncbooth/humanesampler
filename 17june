@@ -3,6 +3,7 @@ np.complex = complex  # for librosa compatibility
 import librosa
 import soundfile as sf
 import pyrubberband as pyrb
+import subprocess
 
 fps = 30  # frames per second
 
@@ -15,7 +16,7 @@ def smpte_to_seconds(smpte):
         subframe = 0
 
     h, m, s, f = map(int, time_part.split(':'))
-    total_frames = h*3600*fps + m*60*fps + s*fps + f + subframe/100
+    total_frames = h * 3600 * fps + m * 60 * fps + s * fps + f + subframe / 100
     return total_frames / fps
 
 def load_table_with_cf(filepath):
@@ -32,47 +33,46 @@ def load_table_with_cf(filepath):
         rows.append(parts)
     return rows
 
-def get_segment(y, sr, source_segments, note, target_dur, rubberband_used):
+def get_segment(y, sr, source_segments, note, target_dur, rubberband_used, used_source_rows, rubberband_details):
     all_segs = source_segments.get(note, [])
     if not all_segs:
         raise ValueError(f"No source segments found for note '{note}'")
 
-    longer = [s for s in all_segs if s[1] >= target_dur]
+    longer = [(idx, s) for idx, s in enumerate(all_segs) if s[1] >= target_dur]
     if longer:
-        seg_start, seg_dur = min(longer, key=lambda x: x[1] - target_dur)
+        seg_idx, (seg_start, seg_dur) = min(longer, key=lambda x: x[1][1] - target_dur)
+        used_source_rows.append(str(seg_idx + 1))
         start_sample = int(seg_start * sr)
         length_samples = int(target_dur * sr)
         return y[start_sample:start_sample + length_samples]
 
-    seg_start, seg_dur = min(all_segs, key=lambda x: abs(x[1] - target_dur))
+    seg_idx, (seg_start, seg_dur) = min(enumerate(all_segs), key=lambda x: abs(x[1][1] - target_dur))
+    used_source_rows.append(str(seg_idx + 1))
     start_sample = int(seg_start * sr)
     end_sample = int((seg_start + seg_dur) * sr)
     raw = y[start_sample:end_sample]
 
     rate = seg_dur / target_dur
     stretched = pyrb.time_stretch(raw, sr, rate)
+    rubberband_used.append(note)
+    rubberband_details.append((note, seg_dur, target_dur, rate))
 
     target_len = int(target_dur * sr)
     if len(stretched) < target_len:
-        stretched = np.pad(stretched, (0, target_len - len(stretched)))
+        return np.pad(stretched, (0, target_len - len(stretched)))
     else:
-        stretched = stretched[:target_len]
-
-    rubberband_used.append((note, round(seg_dur, 4), round(target_dur, 4), round(rate, 4)))
-    return stretched
+        return stretched[:target_len]
 
 def apply_fade_in(audio, sr, fade_dur=0.01):
     fade_samples = int(sr * fade_dur)
-    if fade_samples > len(audio):
-        fade_samples = len(audio)
+    fade_samples = min(fade_samples, len(audio))
     fade_curve = np.linspace(0, 1, fade_samples)
     audio[:fade_samples] *= fade_curve
     return audio
 
 def apply_fade_out(audio, sr, fade_dur=0.01):
     fade_samples = int(sr * fade_dur)
-    if fade_samples > len(audio):
-        fade_samples = len(audio)
+    fade_samples = min(fade_samples, len(audio))
     fade_curve = np.linspace(1, 0, fade_samples)
     audio[-fade_samples:] *= fade_curve
     return audio
@@ -96,10 +96,11 @@ def main():
         return table
 
     source_table = load_table_from_txt('Source table.txt')
+
     y, sr = librosa.load(source_audio_path, sr=None)
 
     source_segments = {}
-    for start, note, length in source_table:
+    for i, (start, note, length) in enumerate(source_table):
         start_sec = smpte_to_seconds(start)
         dur_sec = smpte_to_seconds(length)
         if note not in source_segments:
@@ -115,6 +116,8 @@ def main():
     output = np.zeros(output_len)
 
     rubberband_used = []
+    rubberband_details = []
+    used_source_rows = []
 
     for i, row in enumerate(dest_rows):
         start_smpte, note, length_orig, cf, length_with_cf = row
@@ -126,8 +129,9 @@ def main():
 
         if note == 'S':
             segment = np.zeros(length_samples)
+            used_source_rows.append('S')
         else:
-            segment = get_segment(y, sr, source_segments, note, dur_sec, rubberband_used)
+            segment = get_segment(y, sr, source_segments, note, dur_sec, rubberband_used, used_source_rows, rubberband_details)
 
         if i > 0 and dest_rows[i-1][1] == 'S' and note != 'S':
             segment = apply_fade_in(segment, sr, fade_dur=0.01)
@@ -159,14 +163,16 @@ def main():
             output[start_sample:start_sample+length_samples] += segment
 
     sf.write(output_audio_path, output, sr)
+
     print(f"\n✅ Done! Output saved as '{output_audio_path}'")
 
     if rubberband_used:
-        print("\n🎧 Rubber Band was used for the following notes:")
-        for note, src_dur, tgt_dur, rate in rubberband_used:
-            print(f" - Note: {note}, Source: {src_dur}s → Target: {tgt_dur}s (Rate: {rate})")
-    else:
-        print("\n✅ No Rubber Band stretching was needed.")
+        print("\nRubber Band was used for the following notes:")
+        for note, src_dur, tgt_dur, rate in rubberband_details:
+            print(f" - Note: {note}, Source: {src_dur:.3f}s → Target: {tgt_dur:.3f}s (Rate: {rate:.4f})")
+
+    print("\nSource segments used (by row number or 'S'):")
+    print(", ".join(used_source_rows))
 
 if __name__ == "__main__":
     main()

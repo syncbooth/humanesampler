@@ -1,0 +1,154 @@
+import numpy as np
+np.complex = complex  # for librosa compatibility
+import librosa
+import soundfile as sf
+import pyrubberband as pyrb
+
+fps = 30  # frames per second
+
+def smpte_to_seconds(smpte):
+    if '.' in smpte:
+        time_part, subframes = smpte.split('.')
+        subframe = int(subframes)
+    else:
+        time_part = smpte
+        subframe = 0
+    h, m, s, f = map(int, time_part.split(':'))
+    total_frames = h*3600*fps + m*60*fps + s*fps + f + subframe/100
+    return total_frames / fps
+
+def load_table_with_cf(filepath):
+    rows = []
+    with open(filepath, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("SMPTE") or line.startswith("----"):
+            continue
+        parts = line.split('\t')
+        if len(parts) < 5:
+            continue
+        rows.append(parts)
+    return rows
+
+def get_segment(y, sr, source_segments, note, target_dur):
+    import pyrubberband as pyrb
+
+    all_segs = source_segments.get(note, [])
+    if not all_segs:
+        raise ValueError(f"No source segments found for note '{note}'")
+
+    longer = [s for s in all_segs if s[1] >= target_dur]
+    if longer:
+        seg_start, seg_dur = min(longer, key=lambda x: x[1] - target_dur)
+        start_sample = int(seg_start * sr)
+        length_samples = int(target_dur * sr)
+        return y[start_sample:start_sample + length_samples]
+
+    # Otherwise: pick closest and stretch it
+    seg_start, seg_dur = min(all_segs, key=lambda x: abs(x[1] - target_dur))
+    start_sample = int(seg_start * sr)
+    end_sample = int((seg_start + seg_dur) * sr)
+    raw = y[start_sample:end_sample].astype(np.float32)  # Important for pyrb
+
+    rate = seg_dur / target_dur
+    stretched = pyrb.time_stretch(raw, sr, rate)
+
+    return stretched  # Do not trim/pad unless absolutely needed
+
+
+def apply_fade_in(audio, sr, fade_dur=0.01):
+    fade_samples = int(sr * fade_dur)
+    fade_samples = min(fade_samples, len(audio))
+    fade_curve = np.linspace(0, 1, fade_samples)
+    audio[:fade_samples] *= fade_curve
+    return audio
+
+def apply_fade_out(audio, sr, fade_dur=0.01):
+    fade_samples = int(sr * fade_dur)
+    fade_samples = min(fade_samples, len(audio))
+    fade_curve = np.linspace(1, 0, fade_samples)
+    audio[-fade_samples:] *= fade_curve
+    return audio
+
+def main():
+    source_audio_path = "example.wav"
+    destination_table_with_cf_path = "Destination table with Cf.txt"
+    output_audio_path = "stitched_output_crossfaded_with_fades.wav"
+
+    def load_table_from_txt(filepath):
+        table = []
+        with open(filepath, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        for line in lines[2:]:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split('\t')
+            if len(parts) == 3:
+                table.append(tuple(parts))
+        return table
+
+    source_table = load_table_from_txt('Source table.txt')
+
+    y, sr = librosa.load(source_audio_path, sr=None)
+
+    source_segments = {}
+    for start, note, length in source_table:
+        start_sec = smpte_to_seconds(start)
+        dur_sec = smpte_to_seconds(length)
+        source_segments.setdefault(note, []).append((start_sec, dur_sec))
+
+    dest_rows = load_table_with_cf(destination_table_with_cf_path)
+
+    last_start_sec = smpte_to_seconds(dest_rows[-1][0])
+    last_len_sec = smpte_to_seconds(dest_rows[-1][4])
+    total_duration = last_start_sec + last_len_sec
+    output_len = int(total_duration * sr) + sr
+    output = np.zeros(output_len)
+
+    for i, row in enumerate(dest_rows):
+        start_smpte, note, length_orig, cf, length_with_cf = row
+        start_sec = smpte_to_seconds(start_smpte)
+        dur_sec = smpte_to_seconds(length_with_cf)
+        start_sample = int(start_sec * sr)
+        length_samples = int(dur_sec * sr)
+
+        if note == 'S':
+            segment = np.zeros(length_samples)
+        else:
+            segment = get_segment(y, sr, source_segments, note, dur_sec)
+
+        if i > 0 and dest_rows[i-1][1] == 'S' and note != 'S':
+            segment = apply_fade_in(segment, sr)
+
+        if i < len(dest_rows) - 1 and dest_rows[i+1][1] == 'S' and note != 'S':
+            segment = apply_fade_out(segment, sr)
+
+        if i > 0:
+            prev_start_sec = smpte_to_seconds(dest_rows[i-1][0])
+            prev_len_sec = smpte_to_seconds(dest_rows[i-1][4])
+            prev_end_sample = int((prev_start_sec + prev_len_sec) * sr)
+
+            if prev_end_sample > start_sample:
+                overlap_len = prev_end_sample - start_sample
+                if overlap_len > 0:
+                    fade_out = np.linspace(1, 0, overlap_len)
+                    fade_in = np.linspace(0, 1, overlap_len)
+                    output[start_sample:start_sample+overlap_len] = (
+                        output[start_sample:start_sample+overlap_len] * fade_out +
+                        segment[:overlap_len] * fade_in
+                    )
+                    output[start_sample+overlap_len:start_sample+length_samples] += segment[overlap_len:]
+                else:
+                    output[start_sample:start_sample+length_samples] += segment
+            else:
+                output[start_sample:start_sample+length_samples] += segment
+        else:
+            output[start_sample:start_sample+length_samples] += segment
+
+    sf.write(output_audio_path, output, sr)
+    print(f"✅ Done! Output saved as '{output_audio_path}'")
+
+if __name__ == "__main__":
+    main()

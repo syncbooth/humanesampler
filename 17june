@@ -13,6 +13,7 @@ def smpte_to_seconds(smpte):
     else:
         time_part = smpte
         subframe = 0
+
     h, m, s, f = map(int, time_part.split(':'))
     total_frames = h*3600*fps + m*60*fps + s*fps + f + subframe/100
     return total_frames / fps
@@ -31,9 +32,7 @@ def load_table_with_cf(filepath):
         rows.append(parts)
     return rows
 
-def get_segment(y, sr, source_segments, note, target_dur):
-    import pyrubberband as pyrb
-
+def get_segment(y, sr, source_segments, note, target_dur, rubberband_used):
     all_segs = source_segments.get(note, [])
     if not all_segs:
         raise ValueError(f"No source segments found for note '{note}'")
@@ -45,28 +44,35 @@ def get_segment(y, sr, source_segments, note, target_dur):
         length_samples = int(target_dur * sr)
         return y[start_sample:start_sample + length_samples]
 
-    # Otherwise: pick closest and stretch it
     seg_start, seg_dur = min(all_segs, key=lambda x: abs(x[1] - target_dur))
     start_sample = int(seg_start * sr)
     end_sample = int((seg_start + seg_dur) * sr)
-    raw = y[start_sample:end_sample].astype(np.float32)  # Important for pyrb
+    raw = y[start_sample:end_sample]
 
     rate = seg_dur / target_dur
     stretched = pyrb.time_stretch(raw, sr, rate)
 
-    return stretched  # Do not trim/pad unless absolutely needed
+    target_len = int(target_dur * sr)
+    if len(stretched) < target_len:
+        stretched = np.pad(stretched, (0, target_len - len(stretched)))
+    else:
+        stretched = stretched[:target_len]
 
+    rubberband_used.append((note, round(seg_dur, 4), round(target_dur, 4), round(rate, 4)))
+    return stretched
 
 def apply_fade_in(audio, sr, fade_dur=0.01):
     fade_samples = int(sr * fade_dur)
-    fade_samples = min(fade_samples, len(audio))
+    if fade_samples > len(audio):
+        fade_samples = len(audio)
     fade_curve = np.linspace(0, 1, fade_samples)
     audio[:fade_samples] *= fade_curve
     return audio
 
 def apply_fade_out(audio, sr, fade_dur=0.01):
     fade_samples = int(sr * fade_dur)
-    fade_samples = min(fade_samples, len(audio))
+    if fade_samples > len(audio):
+        fade_samples = len(audio)
     fade_curve = np.linspace(1, 0, fade_samples)
     audio[-fade_samples:] *= fade_curve
     return audio
@@ -90,14 +96,15 @@ def main():
         return table
 
     source_table = load_table_from_txt('Source table.txt')
-
     y, sr = librosa.load(source_audio_path, sr=None)
 
     source_segments = {}
     for start, note, length in source_table:
         start_sec = smpte_to_seconds(start)
         dur_sec = smpte_to_seconds(length)
-        source_segments.setdefault(note, []).append((start_sec, dur_sec))
+        if note not in source_segments:
+            source_segments[note] = []
+        source_segments[note].append((start_sec, dur_sec))
 
     dest_rows = load_table_with_cf(destination_table_with_cf_path)
 
@@ -107,23 +114,26 @@ def main():
     output_len = int(total_duration * sr) + sr
     output = np.zeros(output_len)
 
+    rubberband_used = []
+
     for i, row in enumerate(dest_rows):
         start_smpte, note, length_orig, cf, length_with_cf = row
         start_sec = smpte_to_seconds(start_smpte)
         dur_sec = smpte_to_seconds(length_with_cf)
+
         start_sample = int(start_sec * sr)
         length_samples = int(dur_sec * sr)
 
         if note == 'S':
             segment = np.zeros(length_samples)
         else:
-            segment = get_segment(y, sr, source_segments, note, dur_sec)
+            segment = get_segment(y, sr, source_segments, note, dur_sec, rubberband_used)
 
         if i > 0 and dest_rows[i-1][1] == 'S' and note != 'S':
-            segment = apply_fade_in(segment, sr)
+            segment = apply_fade_in(segment, sr, fade_dur=0.01)
 
         if i < len(dest_rows) - 1 and dest_rows[i+1][1] == 'S' and note != 'S':
-            segment = apply_fade_out(segment, sr)
+            segment = apply_fade_out(segment, sr, fade_dur=0.01)
 
         if i > 0:
             prev_start_sec = smpte_to_seconds(dest_rows[i-1][0])
@@ -135,6 +145,7 @@ def main():
                 if overlap_len > 0:
                     fade_out = np.linspace(1, 0, overlap_len)
                     fade_in = np.linspace(0, 1, overlap_len)
+
                     output[start_sample:start_sample+overlap_len] = (
                         output[start_sample:start_sample+overlap_len] * fade_out +
                         segment[:overlap_len] * fade_in
@@ -148,7 +159,14 @@ def main():
             output[start_sample:start_sample+length_samples] += segment
 
     sf.write(output_audio_path, output, sr)
-    print(f"✅ Done! Output saved as '{output_audio_path}'")
+    print(f"\n✅ Done! Output saved as '{output_audio_path}'")
+
+    if rubberband_used:
+        print("\n🎧 Rubber Band was used for the following notes:")
+        for note, src_dur, tgt_dur, rate in rubberband_used:
+            print(f" - Note: {note}, Source: {src_dur}s → Target: {tgt_dur}s (Rate: {rate})")
+    else:
+        print("\n✅ No Rubber Band stretching was needed.")
 
 if __name__ == "__main__":
     main()

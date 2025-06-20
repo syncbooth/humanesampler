@@ -22,13 +22,12 @@ pre_attack_time = 0.06
 post_release_time = 0.0
 frame_length = 2048
 hop_length = 512
-adjustment_sec = 0.0  # Silence shift from Code 2 (set 0 for now)
 
 # --- Load audio ---
 y, sr = librosa.load(filename, sr=None)
-audio_duration = len(y)/sr
+audio_duration = len(y) / sr
 
-# --- Compute RMS and dB ---
+# --- Compute RMS and dB (global) ---
 rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
 rms_db = librosa.amplitude_to_db(rms, ref=np.max)
 times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop_length)
@@ -52,6 +51,7 @@ for i in range(len(silence_mask)):
             adjusted_end = min(audio_duration, end_time + post_release_time)
             raw_silence_segments.append((adjusted_start, adjusted_end))
 
+# Handle trailing silence
 if in_silence:
     end_time = times[-1]
     duration = end_time - start_time
@@ -60,90 +60,107 @@ if in_silence:
         adjusted_end = min(audio_duration, end_time + post_release_time)
         raw_silence_segments.append((adjusted_start, adjusted_end))
 
-# --- Apply silence adjustment shift ---
-silence_segments = []
-for i, (start, end) in enumerate(raw_silence_segments):
-    if i == 0:
-        silence_segments.append((start, end))
-    else:
-        new_start = start + adjustment_sec
-        new_end = end - adjustment_sec
-        if new_end > new_start:
-            silence_segments.append((new_start, new_end))
+# Silence segments (no shift)
+silence_segments = raw_silence_segments
 
-# --- Detect transients (onsets) ---
-onset_frames = librosa.onset.onset_detect(y=y, sr=sr, hop_length=hop_length, backtrack=True)
-onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop_length)
+# --- Define sound (non-silence) segments between silences ---
+sound_segments = []
 
-# --- Helper: Check if time is in silence ---
-def is_in_silence(t, silences):
-    return any(start <= t <= end for start, end in silences)
+if silence_segments:
+    # From start to first silence
+    if silence_segments[0][0] > 0:
+        sound_segments.append((0, silence_segments[0][0]))
+    # Between silences
+    for i in range(len(silence_segments) - 1):
+        sound_segments.append((silence_segments[i][1], silence_segments[i+1][0]))
+    # From last silence to end
+    if silence_segments[-1][1] < audio_duration:
+        sound_segments.append((silence_segments[-1][1], audio_duration))
+else:
+    # No silence detected, whole audio is sound
+    sound_segments.append((0, audio_duration))
 
-# --- Filter onsets: exclude those in silence or below transient threshold ---
+# --- Onset detection & filtering with local RMS dB reference ---
 filtered_onsets = []
-for onset_time in onset_times:
-    if is_in_silence(onset_time, silence_segments):
-        continue
-    rms_idx = np.argmin(np.abs(times - onset_time))
-    if rms_db[rms_idx] >= threshold_db_transient:
-        filtered_onsets.append(onset_time)
 
-# --- Combine events ---
+for seg_start, seg_end in sound_segments:
+    start_sample = int(seg_start * sr)
+    end_sample = int(seg_end * sr)
+    y_seg = y[start_sample:end_sample]
+
+    # RMS for segment
+    rms_seg = librosa.feature.rms(y=y_seg, frame_length=frame_length, hop_length=hop_length)[0]
+    times_seg = librosa.frames_to_time(np.arange(len(rms_seg)), sr=sr, hop_length=hop_length)
+    times_seg += seg_start
+
+    # Local RMS dB (max in segment as ref)
+    if rms_seg.size == 0:
+        continue  # skip empty segments
+    rms_db_local = librosa.amplitude_to_db(rms_seg, ref=np.max)
+
+    # Onset detection in segment
+    onset_frames = librosa.onset.onset_detect(y=y_seg, sr=sr, hop_length=hop_length, backtrack=True)
+    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop_length)
+    onset_times += seg_start
+
+    # Filter onsets using local RMS dB threshold
+    for onset_time in onset_times:
+        idx = np.argmin(np.abs(times_seg - onset_time))
+        if rms_db_local[idx] >= threshold_db_transient:
+            filtered_onsets.append(onset_time)
+
+filtered_onsets.sort()
+
+# --- Combine events (silences and filtered onsets) ---
 events = []
-
-# Add silence starts as 'S'
-for (start, end) in silence_segments:
+for start, end in silence_segments:
     events.append((start, 'S'))
-
-# Add filtered onsets as None for now
 for onset in filtered_onsets:
     events.append((onset, None))
-
-# Sort by time
 events.sort(key=lambda x: x[0])
 
-# --- Pitch detection for notes ---
+# --- Pitch detection per note segment ---
 transient_segments = filtered_onsets + [audio_duration]
-
 note_dict = {}
+
 for i in range(len(filtered_onsets)):
     start_time = transient_segments[i]
     end_time = transient_segments[i+1]
-    y_seg = y[int(start_time * sr):int(end_time * sr)]
+    start_sample = int(start_time * sr)
+    end_sample = int(end_time * sr)
+    y_seg = y[start_sample:end_sample]
 
-    f0, voiced_flag, _ = librosa.pyin(
-        y_seg,
-        fmin=librosa.note_to_hz('C2'),
-        fmax=librosa.note_to_hz('C7'),
-        sr=sr,
-        frame_length=frame_length,
-        hop_length=hop_length
-    )
-
-    if f0 is not None and np.any(voiced_flag):
-        voiced_pitches = f0[voiced_flag]
-        median_pitch = np.median(voiced_pitches)
-        note = librosa.hz_to_note(median_pitch)
-    else:
+    if len(y_seg) == 0:
         note = "Unknown"
+    else:
+        f0, voiced_flag, _ = librosa.pyin(
+            y_seg,
+            fmin=librosa.note_to_hz('C2'),
+            fmax=librosa.note_to_hz('C7'),
+            sr=sr,
+            frame_length=frame_length,
+            hop_length=hop_length
+        )
+        if f0 is not None and np.any(voiced_flag):
+            voiced_pitches = f0[voiced_flag]
+            median_pitch = np.median(voiced_pitches)
+            note = librosa.hz_to_note(median_pitch)
+        else:
+            note = "Unknown"
 
     note_dict[start_time] = note
 
-# --- Print table with segment length ---
+# --- Print the table ---
 print(f"{'Onset (SMPTE)':<15} | {'Note':<7} | {'Length (s)':<10}")
 print("-" * 40)
-
 for i, (event_time, label) in enumerate(events):
     smpte_time = seconds_to_smpte(event_time)
-    # Determine note or silence
     if label == 'S':
         note_label = 'S'
     else:
         note_label = note_dict.get(event_time, 'Unknown')
-    # Calculate length to next event or audio end
     if i < len(events) - 1:
         length_sec = events[i+1][0] - event_time
     else:
         length_sec = audio_duration - event_time
-
     print(f"{smpte_time:<15} | {note_label:<7} | {length_sec:<10.3f}")

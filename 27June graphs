@@ -46,12 +46,14 @@ def hz_to_note(freq):
     return f"{note}{octave}"
 
 # Load audio
-filename = 'Gated example.wav'
+filename = 'example.wav'
 y, sr = librosa.load(filename, sr=None)
 
 # Detect onsets and prepend 0.0
 onsets = detect_onsets_with_threshold(y, sr)
 onsets = [0.0] + onsets
+audio_duration = librosa.get_duration(y=y, sr=sr)
+onsets.append(audio_duration)
 
 # Output folder
 base_name = os.path.splitext(filename)[0]
@@ -89,26 +91,48 @@ for i in range(len(onsets) - 1):
         grouped_lines.append(line)
     wrapped_text = "\n".join(grouped_lines)
 
-    # Create plot
-    fig, ax = plt.subplots(figsize=(14, 6))
-    ax.plot(absolute_times, f0, marker='o', linestyle='-', color='b')
-    ax.set_title(f"Segment {i} — {mean_note} — SMPTE: {smpte_time}")
-    ax.set_xlabel("Time (seconds)")
-    ax.set_ylabel("Pitch (Hz)")
-    ax.grid(True)
+        # Compute RMS for loudness
+    rms = librosa.feature.rms(y=segment, frame_length=2048, hop_length=512)[0]
+    rms_times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=512)
+    rms_times = rms_times + start  # shift relative to full audio
 
-    # Add textbox
+    # Create 2 subplots: pitch (top), loudness (bottom)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
+    
+    # Pitch plot
+    ax1.plot(absolute_times, f0, marker='o', linestyle='-', color='b')
+    ax1.set_title(f"Segment {i} — {mean_note} — SMPTE: {smpte_time}")
+    ax1.set_ylabel("Pitch (Hz)")
+    ax1.grid(True)
+
+    # Loudness plot
+    ax2.plot(rms_times, rms, color='orange')
+    ax2.set_ylabel("Loudness (RMS)")
+    ax2.set_xlabel("Time (seconds)")
+    ax2.grid(True)
+
+    # Add text box
     fig.text(0.72, 0.5, wrapped_text, fontsize=9, va='center', ha='left',
              bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.5'),
              transform=fig.transFigure, clip_on=False)
+    # RMS start and end values
+    rms_start = round(rms[0], 2) if len(rms) > 0 else 0.0
+    rms_end = round(rms[-1], 2) if len(rms) > 0 else 0.0
+    rms_text = f"RMS Start: {rms_start}\nRMS End: {rms_end}"
 
-    # Adjust and save
-    plt.subplots_adjust(right=0.7)
+    # Add second text box
+    fig.text(0.72, 0.3, rms_text, fontsize=9, va='center', ha='left',
+         bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.5'),
+         transform=fig.transFigure, clip_on=False)
+
+    # Adjust layout and save
+    plt.subplots_adjust(right=0.7, hspace=0.3)
     safe_note = mean_note.replace("#", "s")
     image_filename = f"segment_{i}_{safe_note}.png"
     filepath = os.path.join(output_folder, image_filename)
     plt.savefig(filepath)
     plt.close()
+
 
 # Output table to terminal
 df = pd.DataFrame(segment_data, columns=["Onset (SMPTE)", "Mean Note"])

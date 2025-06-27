@@ -1,0 +1,117 @@
+import librosa
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+
+def detect_onsets_with_threshold(y, sr, threshold_db=-40, frame_length=2048, hop_length=512):
+    rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+    rms_db = librosa.amplitude_to_db(rms, ref=np.max)
+    times = librosa.frames_to_time(np.arange(len(rms_db)), sr=sr, hop_length=hop_length)
+
+    onset_frames = librosa.onset.onset_detect(y=y, sr=sr, hop_length=hop_length, backtrack=True)
+    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop_length)
+
+    filtered_onsets = []
+    for t in onset_times:
+        idx = np.argmin(np.abs(times - t))
+        if rms_db[idx] >= threshold_db:
+            filtered_onsets.append(t)
+    return filtered_onsets
+
+def seconds_to_smpte(seconds, fps=30, subframes=80):
+    total_frames = seconds * fps
+    frame_number = int(total_frames)
+    fractional = total_frames - frame_number
+    subframe_number = int(fractional * subframes)
+
+    hours = frame_number // (fps * 60 * 60)
+    remainder = frame_number % (fps * 60 * 60)
+    minutes = remainder // (fps * 60)
+    remainder = remainder % (fps * 60)
+    secs = remainder // fps
+    frames = remainder % fps
+
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}:{frames:02d}.{subframe_number:02d}"
+
+def hz_to_note(freq):
+    if freq <= 0 or np.isnan(freq):
+        return "N/A"
+    note_number = 12 * np.log2(freq / 440.0) + 69
+    note_number = int(round(note_number))
+    note_names = ['C', 'C#', 'D', 'D#', 'E', 'F',
+                  'F#', 'G', 'G#', 'A', 'A#', 'B']
+    octave = note_number // 12 - 1
+    note = note_names[note_number % 12]
+    return f"{note}{octave}"
+
+# Load audio
+filename = 'Gated example.wav'
+y, sr = librosa.load(filename, sr=None)
+
+# Detect onsets and prepend 0.0
+onsets = detect_onsets_with_threshold(y, sr)
+onsets = [0.0] + onsets
+
+# Output folder
+base_name = os.path.splitext(filename)[0]
+output_folder = f"{base_name}_segment_graphics"
+os.makedirs(output_folder, exist_ok=True)
+
+# Segment analysis
+segment_data = []
+
+for i in range(len(onsets) - 1):
+    start = onsets[i]
+    end = onsets[i + 1]
+    start_sample = int(start * sr)
+    end_sample = int(end * sr)
+    segment = y[start_sample:end_sample]
+
+    # Pitch detection
+    f0 = librosa.yin(segment, fmin=librosa.note_to_hz('C2'),
+                     fmax=librosa.note_to_hz('C7'), sr=sr)
+    f0 = f0[~np.isnan(f0)]
+    times = librosa.times_like(f0, sr=sr)
+    times = times[:len(f0)]  # trim to match
+    absolute_times = times + start
+
+    mean_freq = np.mean(f0) if len(f0) > 0 else 0
+    mean_note = hz_to_note(mean_freq)
+    smpte_time = seconds_to_smpte(start)
+    segment_data.append([smpte_time, mean_note])
+
+    # Format Hz values (integers, 11 per line)
+    hz_int_values = [str(int(round(val))) for val in f0]
+    grouped_lines = []
+    for j in range(0, len(hz_int_values), 11):
+        line = ", ".join(hz_int_values[j:j+11])
+        grouped_lines.append(line)
+    wrapped_text = "\n".join(grouped_lines)
+
+    # Create plot
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.plot(absolute_times, f0, marker='o', linestyle='-', color='b')
+    ax.set_title(f"Segment {i} — {mean_note} — SMPTE: {smpte_time}")
+    ax.set_xlabel("Time (seconds)")
+    ax.set_ylabel("Pitch (Hz)")
+    ax.grid(True)
+
+    # Add textbox
+    fig.text(0.72, 0.5, wrapped_text, fontsize=9, va='center', ha='left',
+             bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.5'),
+             transform=fig.transFigure, clip_on=False)
+
+    # Adjust and save
+    plt.subplots_adjust(right=0.7)
+    safe_note = mean_note.replace("#", "s")
+    image_filename = f"segment_{i}_{safe_note}.png"
+    filepath = os.path.join(output_folder, image_filename)
+    plt.savefig(filepath)
+    plt.close()
+
+# Output table to terminal
+df = pd.DataFrame(segment_data, columns=["Onset (SMPTE)", "Mean Note"])
+print("\nSegment Summary:")
+print(df.to_string(index=True))
+print(f"\nAll segment graphs saved to: {output_folder}")

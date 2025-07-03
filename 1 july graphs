@@ -77,45 +77,17 @@ for i in range(len(onsets) - 1):
                      fmax=librosa.note_to_hz('C7'), sr=sr)
     f0 = f0[~np.isnan(f0)] # ← This removes NaNs
 
+    # Calculate swell tendency
+    if len(f0) > 1:
+        swell_tendency = np.sum(np.diff(f0))
+    else:
+        swell_tendency = 0
+        
     mean_freq = np.mean(f0) if len(f0) > 0 else 0
     
     segment_duration = end - start
 
-    # Initialize text for swell detection box (empty if no swell)
-    swell_segment_text = ""
-
-    if i > 0 and i < len(onsets) - 2 and len(f0) > 1:
-        pitch_diff = f0[-1] - f0[0]
-        abs_pitch_diff = abs(pitch_diff)
-        is_increasing = pitch_diff > 0
-        is_decreasing = pitch_diff < 0
-
-        prev_start = onsets[i - 1]
-        prev_end = onsets[i]
-        prev_segment = y[int(prev_start * sr):int(prev_end * sr)]
-        prev_f0 = librosa.yin(prev_segment, fmin=librosa.note_to_hz('C2'),
-                              fmax=librosa.note_to_hz('C7'), sr=sr)
-        prev_f0 = prev_f0[~np.isnan(prev_f0)]
-        prev_last_hz = prev_f0[-1] if len(prev_f0) > 0 else 0
-
-        next_start = onsets[i + 1]
-        next_end = onsets[i + 2]
-        next_segment = y[int(next_start * sr):int(next_end * sr)]
-        next_f0 = librosa.yin(next_segment, fmin=librosa.note_to_hz('C2'),
-                              fmax=librosa.note_to_hz('C7'), sr=sr)
-        next_f0 = next_f0[~np.isnan(next_f0)]
-        next_first_hz = next_f0[0] if len(next_f0) > 0 else 0
-
-        first_hz = f0[0]
-        last_hz = f0[-1]
-
-        if segment_duration < 10 and abs_pitch_diff > 5:
-            if is_increasing and (first_hz >= prev_last_hz) and (last_hz <= next_first_hz):
-                swell_segment_text = "Swell up segment"
-
-            if is_decreasing and (first_hz >= prev_last_hz) and (last_hz <= next_first_hz):
-                swell_segment_text = "Swell down segment"
-
+    
     max_mean_deviation = 0
     if len(f0) > 0:
         max_mean_deviation = max(abs(max(f0) - mean_freq), abs(min(f0) - mean_freq))
@@ -124,19 +96,32 @@ for i in range(len(onsets) - 1):
     smpte_time = seconds_to_smpte(start)
     segment_data.append([smpte_time, mean_note])
 
-    from scipy.stats import zscore
+    from scipy.ndimage import label
+    from collections import Counter
 
     outlier_text = ""
     f0_clean = f0.copy()
-    if len(f0) > 4 and max_mean_deviation > 100:
-        zscores = zscore(f0)
-        outlier_indices = np.where(np.abs(zscores) > 2.5)[0]  # 2.5 std dev away is considered unusual
-        if len(outlier_indices) > 0:
-            # Remove outliers and recompute mean
-            f0_no_outliers = np.delete(f0, outlier_indices)
-            mean_freq_no_outliers = np.mean(f0_no_outliers) if len(f0_no_outliers) > 0 else 0
-            mean_note_no_outliers = hz_to_note(mean_freq_no_outliers)
-            outlier_text = f"Possible noise — MeanHz*: {int(round(mean_freq_no_outliers))} → {mean_note_no_outliers}"    
+
+    if len(f0) > 4 and max_mean_deviation > 80:
+        # Step 1: Round frequencies to nearest integer for stability
+        rounded_f0 = np.round(f0).astype(int)
+        
+        # Step 2: Count the frequency of each pitch value
+        freq_counts = Counter(rounded_f0)
+        dominant_freq = freq_counts.most_common(1)[0][0]  # Most frequent Hz value
+
+        # Step 3: Keep only values close to the dominant cluster (±5 Hz window)
+        cluster_mask = np.abs(f0 - dominant_freq) <= 5
+        f0_no_noise = f0[cluster_mask]
+
+        # Step 4: Recompute mean Hz and note
+        mean_freq_no_noise = np.mean(f0_no_noise) if len(f0_no_noise) > 0 else np.mean(f0)
+        mean_note_no_noise = hz_to_note(mean_freq_no_noise)
+
+        outlier_text = f"Noise removed — MeanHz*: {int(round(mean_freq_no_noise))} → {mean_note_no_noise}"
+    else:
+        mean_freq_no_noise = np.mean(f0) if len(f0) > 0 else 0
+
     # Difference from last segment's final Hz
     if len(f0) > 0 and previous_last_f0 is not None:
         hz_transition = abs(f0[0] - previous_last_f0)
@@ -184,7 +169,7 @@ for i in range(len(onsets) - 1):
     
     # Pitch plot
     ax1.plot(absolute_times, f0, marker='o', linestyle='-', color='b')
-    ax1.set_title(f"Segment {i} — {mean_note} — SMPTE: {smpte_time}")
+    ax1.set_title(f"Segment {i} — {mean_note} — SMPTE: {smpte_time} - {segment_duration:.2f}s")
     ax1.set_ylabel("Pitch (Hz)")
     ax1.grid(True)
 
@@ -224,6 +209,15 @@ for i in range(len(onsets) - 1):
          bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.5'),
          transform=fig.transFigure, clip_on=False)
    
+    
+    # Add swell tendency as a text box in top-left corner
+    fig.text(0.72, 0.4,
+         f"Swell Tendency: {swell_tendency:+.0f}",
+         transform=plt.gca().transAxes,
+         fontsize=10,
+         verticalalignment='top',
+         bbox=dict(facecolor='white', edgecolor='black', alpha=0.8))
+    
     # Add text box with maximum mean deviation
     if len(f0) > 0:
        min_hz = np.min(f0)
@@ -255,14 +249,50 @@ for i in range(len(onsets) - 1):
     
     # Add text box if outlier was found
     if outlier_text:
-        fig.text(0.72, 0.4, outlier_text, fontsize=9, va='center', ha='left', color='red',
+        fig.text(0.72, 0.45, outlier_text, fontsize=9, va='center', ha='left', color='darkred',
                  bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.5'),
                  transform=fig.transFigure, clip_on=False)
     
-    if swell_segment_text: 
-        fig.text(0.72, 0.45, swell_segment_text, fontsize=10, color='red', va='center', ha='left',
-                 bbox=dict(facecolor='white', edgecolor='red', boxstyle='round,pad=0.5'),
-                 transform=fig.transFigure, clip_on=False)
+    # Add text box if tendancy is swell up or down
+    if not outlier_text:
+        tolerance = 3
+        current_mean = mean_freq
+        prev_mean = None
+        next_mean = None
+        
+        if i > 0 and i < len(onsets) - 2:
+            # Retrieve previous and next segments' mean Hz
+            prev_start = onsets[i - 1]
+            prev_end = onsets[i]
+            next_start = onsets[i + 1]
+            next_end = onsets[i + 2]
+            
+            prev_segment = y[int(prev_start * sr):int(prev_end * sr)]
+            next_segment = y[int(next_start * sr):int(next_end * sr)]
+
+            prev_f0 = librosa.yin(prev_segment, fmin=librosa.note_to_hz('C2'),
+                                fmax=librosa.note_to_hz('C7'), sr=sr)
+            prev_f0 = prev_f0[~np.isnan(prev_f0)]
+            next_f0 = librosa.yin(next_segment, fmin=librosa.note_to_hz('C2'),
+                                fmax=librosa.note_to_hz('C7'), sr=sr)
+            next_f0 = next_f0[~np.isnan(next_f0)]
+
+            prev_mean = np.mean(prev_f0) if len(prev_f0) > 0 else None
+            next_mean = np.mean(next_f0) if len(next_f0) > 0 else None
+
+        # If both sides available
+        if prev_mean is not None and next_mean is not None:
+            if swell_tendency < -5 and prev_mean - tolerance > current_mean and current_mean > next_mean + tolerance:
+                fig.text(0.72, 0.35, "Swell Down", fontsize=10, va='center', ha='left',
+                        bbox=dict(facecolor='lightblue', edgecolor='gray', boxstyle='round,pad=0.5'),
+                        transform=fig.transFigure, clip_on=False)
+            elif swell_tendency > 5 and prev_mean + tolerance < current_mean and current_mean < next_mean - tolerance:
+                fig.text(0.72, 0.35, "Swell Up", fontsize=10, va='center', ha='left',
+                        bbox=dict(facecolor='lightgreen', edgecolor='gray', boxstyle='round,pad=0.5'),
+                        transform=fig.transFigure, clip_on=False)
+
+
+
 
     # Adjust layout and save
     plt.subplots_adjust(right=0.7, hspace=0.3)

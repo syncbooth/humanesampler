@@ -46,6 +46,46 @@ def hz_to_note(freq):
     note = note_names[note_number % 12]
     return f"{note}{octave}"
 
+def detect_transition_groups(f0):
+    if len(f0) < 4:
+        return False  # Not enough data points to form 3 groups
+
+    # Identify indices where jump > 50 Hz occurs
+    jumps = np.abs(np.diff(f0)) > 50
+    jump_indices = np.where(jumps)[0]
+
+    # Need exactly two jumps for 3 groups
+    if len(jump_indices) != 2:
+        return False
+
+    # Extract groups based on jumps
+    g1 = f0[:jump_indices[0] + 1]
+    g2 = f0[jump_indices[0] + 1: jump_indices[1] + 1]
+    g3 = f0[jump_indices[1] + 1:]
+
+    # Check if each group is stable within ±10 Hz range
+    def is_stable(group):
+        return (np.max(group) - np.min(group)) <= 10
+
+    if not (is_stable(g1) and is_stable(g2) and is_stable(g3)):
+        return False
+
+    # Check mean difference conditions:
+    mean_g1 = np.mean(g1)
+    mean_g2 = np.mean(g2)
+    mean_g3 = np.mean(g3)
+
+    # Mean of group1 and group2 must differ by at least 15 Hz
+    if abs(mean_g1 - mean_g2) < 15:
+        return False
+    
+    # Mean of group1 and group3 must differ by at least 15 Hz
+    if abs(mean_g1 - mean_g3) < 15:
+        return False
+
+    # Passed all conditions, is a transition segment
+    return True
+
 # Load audio
 filename = 'example.wav'
 y, sr = librosa.load(filename, sr=None)
@@ -76,6 +116,9 @@ for i in range(len(onsets) - 1):
     f0 = librosa.yin(segment, fmin=librosa.note_to_hz('C2'),
                      fmax=librosa.note_to_hz('C7'), sr=sr)
     f0 = f0[~np.isnan(f0)] # ← This removes NaNs
+
+    # Detect transition segment
+    is_transition = detect_transition_groups(f0)
 
     # Calculate swell tendency
     if len(f0) > 1:
@@ -121,7 +164,8 @@ for i in range(len(onsets) - 1):
         outlier_text = f"Noise removed — MeanHz*: {int(round(mean_freq_no_noise))} → {mean_note_no_noise}"
     else:
         mean_freq_no_noise = np.mean(f0) if len(f0) > 0 else 0
-
+    
+    
     # Difference from last segment's final Hz
     if len(f0) > 0 and previous_last_f0 is not None:
         hz_transition = abs(f0[0] - previous_last_f0)
@@ -232,7 +276,16 @@ for i in range(len(onsets) - 1):
     fig.text(0.72, 0.6, deviation_text, fontsize=9, va='center', ha='left',
            bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.5'),
            transform=fig.transFigure, clip_on=False)
-    
+    if outlier_text and len(f0_no_noise) > 0:
+        new_mean_freq = np.mean(f0_no_noise)
+        new_deviation = max(abs(np.min(f0_no_noise) - new_mean_freq), abs(np.max(f0_no_noise) - new_mean_freq))
+        new_deviation = round(new_deviation, 2)
+        new_deviation_text = f"Max Mean Dev: {new_deviation} Hz"
+
+        fig.text(0.87, 0.6, new_deviation_text, fontsize=9, va='center', ha='left',
+                 color='red',
+                 bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.5'),
+                 transform=fig.transFigure, clip_on=False)
     # Add text box with Hz transition from previous segment
     transition_text = f"Transition ΔHz: {hz_transition}"
 
@@ -291,8 +344,14 @@ for i in range(len(onsets) - 1):
                         bbox=dict(facecolor='lightgreen', edgecolor='gray', boxstyle='round,pad=0.5'),
                         transform=fig.transFigure, clip_on=False)
 
+    # Add transition label if detected
+    if is_transition:
+        fig.text(0.72, 0.25, "Transition", fontsize=12, va='center', ha='left',
+                 bbox=dict(facecolor='yellow', edgecolor='black', boxstyle='round,pad=0.5'),
+                 transform=fig.transFigure, clip_on=False)            
+    
 
-
+        
 
     # Adjust layout and save
     plt.subplots_adjust(right=0.7, hspace=0.3)

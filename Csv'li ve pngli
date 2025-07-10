@@ -47,6 +47,8 @@ def hz_to_note(freq):
     note = note_names[note_number % 12]
     return f"{note}{octave}"
 
+
+
 def detect_transition_groups(f0):
     if len(f0) < 4:
         return False  # Not enough data points to form 3 groups
@@ -86,6 +88,47 @@ def detect_transition_groups(f0):
 
     # Passed all conditions, is a transition segment
     return True
+
+def detect_note_edge_by_jump(f0_array, rms_array):
+    """
+    Detects note edge type ("Note_start", "Note_end") based on jump and stability in f0,
+    and RMS silence conditions. Returns "Note_start", "Note_end", or "-".
+    """
+    if len(f0_array) < 2:
+        return "-"
+
+    # Find large jump indices
+    jumps = np.abs(np.diff(f0_array)) > 50
+    jump_indices = np.where(jumps)[0]
+
+    if len(jump_indices) == 0:
+        return "-"
+
+    first_jump = jump_indices[0]
+
+    group1_f0 = f0_array[:first_jump + 1]
+    group2_f0 = f0_array[first_jump + 1:]
+
+    def is_stable(freq_group):
+        return (np.max(freq_group) - np.min(freq_group)) <= 15
+
+    if not (is_stable(group1_f0) and is_stable(group2_f0)):
+        return "-"
+
+    # Get RMS values for both groups
+    total_frames = len(rms_array)
+    group1_rms = rms_array[:first_jump + 1] if len(rms_array) > first_jump else []
+    group2_rms = rms_array[first_jump + 1:] if len(rms_array) > first_jump else []
+
+    if len(group1_rms) == 0 or len(group2_rms) == 0:
+        return "-"
+
+    if all(r < 0.005 for r in group1_rms):
+        return "Note_start"
+    elif all(r < 0.005 for r in group2_rms):
+        return "Note_end"
+    else:
+        return "-"
 
 # Load audio
 filename = 'example.wav'
@@ -197,6 +240,7 @@ for i in range(len(onsets) - 1):
 
         # Compute RMS for loudness
     rms = librosa.feature.rms(y=segment, frame_length=2048, hop_length=512)[0]
+    note_edge_label = detect_note_edge_by_jump(f0, rms)
     # RMS transition from previous segment
     if len(rms) > 0 and previous_rms_end is not None:
         rms_transition = abs(rms[0] - previous_rms_end)
@@ -388,7 +432,42 @@ for i in range(len(onsets) - 1):
         fig.text(0.72, 0.05, "Fades in", fontsize=10, va='center', ha='left',
                 bbox=dict(facecolor='lightyellow', edgecolor='gray', boxstyle='round,pad=0.5'),
                 transform=fig.transFigure, clip_on=False)    
+    
+    # Fades out detection
+    is_fade_out = False
+    if i > 0:
+        if i < len(onsets) - 2:
+            next_segment = y[int(onsets[i + 1] * sr):int(onsets[i + 2] * sr)]
+            next_rms = librosa.feature.rms(y=next_segment, frame_length=2048, hop_length=512)[0]
+            next_rms_start = next_rms[0] if len(next_rms) > 0 else 0.0
 
+            if (
+                rms_end < 0.01 and
+                mean_rms > 0.01 and
+                next_rms_start < 0.01 and
+                prev_rms_end >= rms_start
+            ):
+                is_fade_out = True
+
+        elif i == len(onsets) - 2:
+            if rms_end < 0.01 and mean_rms > 0.01:
+                is_fade_out = True
+
+    # Add "Fades out" annotation
+    if is_fade_out:
+        fig.text(0.72, 0.05, "Fades out", fontsize=10, va='center', ha='left',
+                bbox=dict(facecolor='lightcoral', edgecolor='gray', boxstyle='round,pad=0.5'),
+                transform=fig.transFigure, clip_on=False)
+
+    # Add text box if it's "Note_start" or "Note_end"
+    if note_edge_label != "-" and note_edge_label == "Note_start":
+        fig.text(0.52, 0.70, "Note_start", fontsize=10, va='center', ha='left',
+                bbox=dict(facecolor='pink', edgecolor='orange', boxstyle='round,pad=0.5'),
+                transform=fig.transFigure, clip_on=False)    
+    if note_edge_label != "-" and note_edge_label == "Note_end":
+        fig.text(0.52, 0.70, "Note_end", fontsize=10, va='center', ha='left',
+                bbox=dict(facecolor='pink', edgecolor='orange', boxstyle='round,pad=0.5'),
+                transform=fig.transFigure, clip_on=False)    
 
 
     # Adjust layout and save
@@ -461,10 +540,11 @@ for i in range(len(onsets) - 1):
         mean_note_no_noise = hz_to_note(mean_freq_no_noise)
 
         corrected_pitch = mean_note_no_noise
-        noise_label = "Noise"
+        noise_label = "Pitch corrected"
 
     # RMS
     rms = librosa.feature.rms(y=segment, frame_length=2048, hop_length=512)[0]
+
     mean_rms = np.mean(rms) if len(rms) > 0 else 0.0
     rms_start = rms[0] if len(rms) > 0 else 0.0
     rms_end = rms[-1] if len(rms) > 0 else 0.0
@@ -493,11 +573,29 @@ for i in range(len(onsets) - 1):
             prev_rms_end < 0.01 and next_rms_start >= rms_end):
             is_fade_in = True
 
+    # Fade-out detection
+    is_fade_out = False
+    if i > 0 and i < len(onsets) - 2:
+        next_segment = y[int(onsets[i + 1] * sr):int(onsets[i + 2] * sr)]
+        next_rms = librosa.feature.rms(y=next_segment, frame_length=2048, hop_length=512)[0]
+        next_rms_start = next_rms[0] if len(next_rms) > 0 else 0.0
+
+        if (
+            rms_end < 0.01 and
+            mean_rms > 0.01 and
+            next_rms_start < 0.01 and
+            prev_rms_end >= rms_start
+        ):
+            is_fade_out = True
+    elif i == len(onsets) - 2:
+        if rms_end < 0.01 and mean_rms > 0.01:
+            is_fade_out = True      
+
     # Silence condition
     if mean_rms < 0.005:
         mean_note = "S"
         mean_freq_str = "-"
-        noise_label = "-"  # Don't flag noise if it's silence
+        noise_label = "-"
     else:
         mean_freq_str = f"{mean_freq:.2f}"
 
@@ -505,9 +603,18 @@ for i in range(len(onsets) - 1):
     start_smpte = seconds_to_smpte(start)
     end_smpte = seconds_to_smpte(end)
 
-    # Transition and fade labels
+    # Transition label
     transition_label = "Transition" if is_transition else "-"
-    fade_label = "Fade_in" if is_fade_in else "-"
+
+    # Fade label logic (merged column)
+    if is_fade_in and is_fade_out:
+        fade_label = "Fade_in + Fade_out"
+    elif is_fade_in:
+        fade_label = "Fade_in"
+    elif is_fade_out:
+        fade_label = "Fade_out"
+    else:
+        fade_label = "-"
 
     # Adjust values for Transition
     if transition_label == "Transition":
@@ -519,13 +626,24 @@ for i in range(len(onsets) - 1):
         max_dev_str = "-" if mean_note in ["S", "T"] else f"{round(max_dev, 2)}"
         delta_hz_str = "-" if mean_note in ["S", "T"] else f"{round(delta_hz, 2)}"
 
-    # Apply pitch correction if needed
+    # Apply pitch correction
     if corrected_pitch and mean_note != "S":
         if transition_label == "-":
             mean_note = corrected_pitch
             noise_label = "Pitch corrected"
 
-    # Append row
+    # Detect Note_start or Note_end
+    note_group_text = detect_note_edge_by_jump(f0, rms)
+
+    # CSV tweaks
+    if mean_note == "S" or transition_label == "Transition" or noise_label == "Pitch corrected":
+        swell_label = "-"
+    if i > 0:
+        prev_note_group = csv_rows[-1][-1]  # last column of previous row
+        if prev_note_group == "Note_start":
+            fade_label = "-"
+
+    # Append CSV row
     csv_rows.append([
         i,                           # Seg_No
         mean_note,                  # Pitch
@@ -541,9 +659,10 @@ for i in range(len(onsets) - 1):
         round(rms_start, 6),        # RMS_Start
         round(rms_end, 6),          # RMS_End
         round(delta_rms, 6),        # Transition_ΔRMS
-        fade_label,                 # Is_FadeIn
+        fade_label,                 # Fade (merged)
         transition_label,           # Is_Transition
-        noise_label                 # Noise
+        noise_label,                # Noise
+        note_group_text             # Start_Stop
     ])
 
 # Write CSV
@@ -564,9 +683,10 @@ with open(csv_output_path, mode='w', newline='') as csv_file:
         "RMS_Start",
         "RMS_End",
         "Transition_ΔRMS",
-        "Is_FadeIn",
+        "Fade",              # ✅ Merged column
         "Is_Transition",
-        "Noise"
+        "Noise",
+        "Start_Stop"
     ])
     csv_writer.writerows(csv_rows)
 

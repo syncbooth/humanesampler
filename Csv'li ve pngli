@@ -1,0 +1,573 @@
+
+import librosa
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+import csv
+
+def detect_onsets_with_threshold(y, sr, threshold_db=-40, frame_length=2048, hop_length=512):
+    rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+    rms_db = librosa.amplitude_to_db(rms, ref=np.max)
+    times = librosa.frames_to_time(np.arange(len(rms_db)), sr=sr, hop_length=hop_length)
+
+    onset_frames = librosa.onset.onset_detect(y=y, sr=sr, hop_length=hop_length, backtrack=True)
+    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop_length)
+
+    filtered_onsets = []
+    for t in onset_times:
+        idx = np.argmin(np.abs(times - t))
+        if rms_db[idx] >= threshold_db:
+            filtered_onsets.append(t)
+    return filtered_onsets
+
+def seconds_to_smpte(seconds, fps=30, subframes=80):
+    total_frames = seconds * fps
+    frame_number = int(total_frames)
+    fractional = total_frames - frame_number
+    subframe_number = int(fractional * subframes)
+
+    hours = frame_number // (fps * 60 * 60)
+    remainder = frame_number % (fps * 60 * 60)
+    minutes = remainder // (fps * 60)
+    remainder = remainder % (fps * 60)
+    secs = remainder // fps
+    frames = remainder % fps
+
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}:{frames:02d}.{subframe_number:02d}"
+
+def hz_to_note(freq):
+    if freq <= 0 or np.isnan(freq):
+        return "N/A"
+    note_number = 12 * np.log2(freq / 440.0) + 69
+    note_number = int(round(note_number))
+    note_names = ['C', 'C#', 'D', 'D#', 'E', 'F',
+                  'F#', 'G', 'G#', 'A', 'A#', 'B']
+    octave = note_number // 12 - 1
+    note = note_names[note_number % 12]
+    return f"{note}{octave}"
+
+def detect_transition_groups(f0):
+    if len(f0) < 4:
+        return False  # Not enough data points to form 3 groups
+
+    # Identify indices where jump > 50 Hz occurs
+    jumps = np.abs(np.diff(f0)) > 50
+    jump_indices = np.where(jumps)[0]
+
+    # Need exactly two jumps for 3 groups
+    if len(jump_indices) != 2:
+        return False
+
+    # Extract groups based on jumps
+    g1 = f0[:jump_indices[0] + 1]
+    g2 = f0[jump_indices[0] + 1: jump_indices[1] + 1]
+    g3 = f0[jump_indices[1] + 1:]
+
+    # Check if each group is stable within ±10 Hz range
+    def is_stable(group):
+        return (np.max(group) - np.min(group)) <= 10
+
+    if not (is_stable(g1) and is_stable(g2) and is_stable(g3)):
+        return False
+
+    # Check mean difference conditions:
+    mean_g1 = np.mean(g1)
+    mean_g2 = np.mean(g2)
+    mean_g3 = np.mean(g3)
+
+    # Mean of group1 and group2 must differ by at least 15 Hz
+    if abs(mean_g1 - mean_g2) < 15:
+        return False
+    
+    # Mean of group1 and group3 must differ by at least 15 Hz
+    if abs(mean_g1 - mean_g3) < 15:
+        return False
+
+    # Passed all conditions, is a transition segment
+    return True
+
+# Load audio
+filename = 'example.wav'
+y, sr = librosa.load(filename, sr=None)
+
+# Detect onsets and prepend 0.0
+onsets = detect_onsets_with_threshold(y, sr)
+onsets = [0.0] + onsets
+audio_duration = librosa.get_duration(y=y, sr=sr)
+onsets.append(audio_duration)
+
+# Output folder
+base_name = os.path.splitext(filename)[0]
+output_folder = f"{base_name}_segment_graphics"
+os.makedirs(output_folder, exist_ok=True)
+
+# Segment analysis
+segment_data = []
+previous_rms_end = None  # To track last RMS value of previous segment
+previous_last_f0 = None  # to store last pitch value of previous segment
+for i in range(len(onsets) - 1):
+    start = onsets[i]
+    end = onsets[i + 1]
+    start_sample = int(start * sr)
+    end_sample = int(end * sr)
+    segment = y[start_sample:end_sample]
+
+    # Pitch detection
+    f0 = librosa.yin(segment, fmin=librosa.note_to_hz('C2'),
+                     fmax=librosa.note_to_hz('C7'), sr=sr)
+    f0 = f0[~np.isnan(f0)] # ← This removes NaNs
+
+    # Detect transition segment
+    is_transition = detect_transition_groups(f0)
+
+    # Calculate swell tendency
+    if len(f0) > 1:
+        swell_tendency = np.sum(np.diff(f0))
+    else:
+        swell_tendency = 0
+        
+    mean_freq = np.mean(f0) if len(f0) > 0 else 0
+    
+    segment_duration = end - start
+
+    
+    max_mean_deviation = 0
+    if len(f0) > 0:
+        max_mean_deviation = max(abs(max(f0) - mean_freq), abs(min(f0) - mean_freq))
+    
+    mean_note = hz_to_note(mean_freq)
+    smpte_time = seconds_to_smpte(start)
+    segment_data.append([smpte_time, mean_note])
+
+    from scipy.ndimage import label
+    from collections import Counter
+
+    outlier_text = ""
+    f0_clean = f0.copy()
+
+    if len(f0) > 4 and max_mean_deviation > 80:
+        # Step 1: Round frequencies to nearest integer for stability
+        rounded_f0 = np.round(f0).astype(int)
+        
+        # Step 2: Count the frequency of each pitch value
+        freq_counts = Counter(rounded_f0)
+        dominant_freq = freq_counts.most_common(1)[0][0]  # Most frequent Hz value
+
+        # Step 3: Keep only values close to the dominant cluster (±5 Hz window)
+        cluster_mask = np.abs(f0 - dominant_freq) <= 5
+        f0_no_noise = f0[cluster_mask]
+
+        # Step 4: Recompute mean Hz and note
+        mean_freq_no_noise = np.mean(f0_no_noise) if len(f0_no_noise) > 0 else np.mean(f0)
+        mean_note_no_noise = hz_to_note(mean_freq_no_noise)
+
+        outlier_text = f"Noise removed — MeanHz*: {int(round(mean_freq_no_noise))} → {mean_note_no_noise}"
+    else:
+        mean_freq_no_noise = np.mean(f0) if len(f0) > 0 else 0
+    
+    
+    # Difference from last segment's final Hz
+    if len(f0) > 0 and previous_last_f0 is not None:
+        hz_transition = abs(f0[0] - previous_last_f0)
+        hz_transition = round(hz_transition, 2)
+    else:
+        hz_transition = 0.0  # or 'N/A' if you prefer
+
+    
+
+    # Store last Hz of current segment for next iteration
+    previous_last_f0 = f0[-1] if len(f0) > 0 else previous_last_f0
+    times = librosa.times_like(f0, sr=sr)
+    times = times[:len(f0)]  # trim to match
+    absolute_times = times + start
+
+    mean_freq = np.mean(f0) if len(f0) > 0 else 0
+    mean_note = hz_to_note(mean_freq)
+    smpte_time = seconds_to_smpte(start)
+    segment_data.append([smpte_time, mean_note])
+
+    # Format Hz values (integers, 11 per line)
+    hz_int_values = [str(int(round(val))) for val in f0]
+    grouped_lines = []
+    for j in range(0, len(hz_int_values), 11):
+        line = ", ".join(hz_int_values[j:j+11])
+        grouped_lines.append(line)
+    wrapped_text = "\n".join(grouped_lines)
+
+        # Compute RMS for loudness
+    rms = librosa.feature.rms(y=segment, frame_length=2048, hop_length=512)[0]
+    # RMS transition from previous segment
+    if len(rms) > 0 and previous_rms_end is not None:
+        rms_transition = abs(rms[0] - previous_rms_end)
+        rms_transition = round(rms_transition, 4)
+    else:
+        rms_transition = 0.0  # or 'N/A' if you prefer
+
+    # Store this segment's RMS end value
+    previous_rms_end = rms[-1] if len(rms) > 0 else previous_rms_end
+    rms_times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=512)
+    rms_times = rms_times + start  # shift relative to full audio
+
+    # Create 2 subplots: pitch (top), loudness (bottom)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
+    
+    # Pitch plot
+    ax1.plot(absolute_times, f0, marker='o', linestyle='-', color='b')
+    ax1.set_title(f"Segment {i} — {mean_note} — SMPTE: {smpte_time} - {segment_duration:.2f}s")
+    ax1.set_ylabel("Pitch (Hz)")
+    ax1.grid(True)
+
+    # Loudness plot
+    ax2.plot(rms_times, rms, color='orange')
+    ax2.set_ylabel("Loudness (RMS)")
+    ax2.set_xlabel("Time (seconds)")
+    ax2.grid(True)
+
+    # Add text box with Hz values
+    fig.text(0.72, 0.8, wrapped_text, fontsize=9, va='center', ha='left',
+             bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.5'),
+             transform=fig.transFigure, clip_on=False)
+    # RMS start and end values
+    rms_start = round(rms[0], 2) if len(rms) > 0 else 0.0
+    rms_end = round(rms[-1], 2) if len(rms) > 0 else 0.0
+    rms_text = f"RMS Start: {rms_start}\nRMS End: {rms_end}"
+
+    # Add text box with RMS start and end
+    fig.text(0.72, 0.3, rms_text, fontsize=9, va='center', ha='left',
+         bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.5'),
+         transform=fig.transFigure, clip_on=False)
+   
+    # Add text box with mean RMS value
+    mean_rms = round(np.mean(rms), 4) if len(rms) > 0 else 0.0
+    mean_rms_text = f"Mean RMS: {mean_rms}"
+
+    fig.text(0.72, 0.2, mean_rms_text, fontsize=9, va='center', ha='left',
+         bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.5'),
+         transform=fig.transFigure, clip_on=False)
+    
+    # Add text box with mean frequency in Hz
+    mean_hz = round(mean_freq, 2)
+    mean_hz_text = f"Mean Hz: {mean_hz}"
+
+    fig.text(0.72, 0.7, mean_hz_text, fontsize=9, va='center', ha='left',
+         bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.5'),
+         transform=fig.transFigure, clip_on=False)
+   
+    
+    # Add swell tendency as a text box in top-left corner
+    fig.text(0.72, 0.4,
+         f"Swell Tendency: {swell_tendency:+.0f}",
+         transform=plt.gca().transAxes,
+         fontsize=10,
+         verticalalignment='top',
+         bbox=dict(facecolor='white', edgecolor='black', alpha=0.8))
+    
+    # Add text box with maximum mean deviation
+    if len(f0) > 0:
+       min_hz = np.min(f0)
+       max_hz = np.max(f0)
+       deviation = max(abs(min_hz - mean_freq), abs(max_hz - mean_freq))
+       deviation = round(deviation, 2)
+    else:
+       deviation = 0.0
+
+    deviation_text = f"Max Mean Deviation: {deviation} Hz"
+
+    fig.text(0.72, 0.6, deviation_text, fontsize=9, va='center', ha='left',
+           bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.5'),
+           transform=fig.transFigure, clip_on=False)
+    if outlier_text and len(f0_no_noise) > 0:
+        new_mean_freq = np.mean(f0_no_noise)
+        new_deviation = max(abs(np.min(f0_no_noise) - new_mean_freq), abs(np.max(f0_no_noise) - new_mean_freq))
+        new_deviation = round(new_deviation, 2)
+        new_deviation_text = f"Max Mean Dev: {new_deviation} Hz"
+
+        fig.text(0.87, 0.6, new_deviation_text, fontsize=9, va='center', ha='left',
+                 color='red',
+                 bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.5'),
+                 transform=fig.transFigure, clip_on=False)
+    # Add text box with Hz transition from previous segment
+    transition_text = f"Transition ΔHz: {hz_transition}"
+
+    fig.text(0.72, 0.5, transition_text, fontsize=9, va='center', ha='left',
+             bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.5'),
+             transform=fig.transFigure, clip_on=False)
+
+    # Add text box with RMS transition from previous segment
+    rms_transition_text = f"Transition ΔRMS: {rms_transition}"
+
+    fig.text(0.72, 0.1, rms_transition_text, fontsize=9, va='center', ha='left',
+             bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.5'),
+             transform=fig.transFigure, clip_on=False)  
+    
+    # Add text box if outlier was found
+    if outlier_text:
+        fig.text(0.72, 0.45, outlier_text, fontsize=9, va='center', ha='left', color='darkred',
+                 bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.5'),
+                 transform=fig.transFigure, clip_on=False)
+    
+    # Add text box if tendancy is swell up or down
+    if not outlier_text:
+        tolerance = 3
+        current_mean = mean_freq
+        prev_mean = None
+        next_mean = None
+        
+        if i > 0 and i < len(onsets) - 2:
+            # Retrieve previous and next segments' mean Hz
+            prev_start = onsets[i - 1]
+            prev_end = onsets[i]
+            next_start = onsets[i + 1]
+            next_end = onsets[i + 2]
+            
+            prev_segment = y[int(prev_start * sr):int(prev_end * sr)]
+            next_segment = y[int(next_start * sr):int(next_end * sr)]
+
+            prev_f0 = librosa.yin(prev_segment, fmin=librosa.note_to_hz('C2'),
+                                fmax=librosa.note_to_hz('C7'), sr=sr)
+            prev_f0 = prev_f0[~np.isnan(prev_f0)]
+            next_f0 = librosa.yin(next_segment, fmin=librosa.note_to_hz('C2'),
+                                fmax=librosa.note_to_hz('C7'), sr=sr)
+            next_f0 = next_f0[~np.isnan(next_f0)]
+
+            prev_mean = np.mean(prev_f0) if len(prev_f0) > 0 else None
+            next_mean = np.mean(next_f0) if len(next_f0) > 0 else None
+
+        # If both sides available
+        if prev_mean is not None and next_mean is not None:
+            if swell_tendency < -5 and prev_mean - tolerance > current_mean and current_mean > next_mean + tolerance:
+                fig.text(0.72, 0.35, "Swell Down", fontsize=10, va='center', ha='left',
+                        bbox=dict(facecolor='lightblue', edgecolor='gray', boxstyle='round,pad=0.5'),
+                        transform=fig.transFigure, clip_on=False)
+            elif swell_tendency > 5 and prev_mean + tolerance < current_mean and current_mean < next_mean - tolerance:
+                fig.text(0.72, 0.35, "Swell Up", fontsize=10, va='center', ha='left',
+                        bbox=dict(facecolor='lightgreen', edgecolor='gray', boxstyle='round,pad=0.5'),
+                        transform=fig.transFigure, clip_on=False)
+
+    # Add transition label if detected
+    if is_transition:
+        fig.text(0.72, 0.25, "Transition", fontsize=12, va='center', ha='left',
+                 bbox=dict(facecolor='yellow', edgecolor='black', boxstyle='round,pad=0.5'),
+                 transform=fig.transFigure, clip_on=False)            
+    
+    
+    # Fades in detection (updated logic)
+    is_fade_in = False
+    if i > 0 and i < len(onsets) - 2:
+        # Previous segment
+        prev_start = onsets[i - 1]
+        prev_end = onsets[i]
+        prev_segment = y[int(prev_start * sr):int(prev_end * sr)]
+        prev_rms = librosa.feature.rms(y=prev_segment, frame_length=2048, hop_length=512)[0]
+        prev_rms_end = prev_rms[-1] if len(prev_rms) > 0 else 0.0
+
+        # Current segment
+        rms_start = rms[0] if len(rms) > 0 else 0.0
+        rms_end = rms[-1] if len(rms) > 0 else 0.0
+        mean_rms = np.mean(rms) if len(rms) > 0 else 0.0
+
+        # Next segment
+        next_start = onsets[i + 1]
+        next_end = onsets[i + 2]
+        next_segment = y[int(next_start * sr):int(next_end * sr)]
+        next_rms = librosa.feature.rms(y=next_segment, frame_length=2048, hop_length=512)[0]
+        next_rms_start = next_rms[0] if len(next_rms) > 0 else 0.0
+
+        # Apply conditions
+        if (
+            rms_start < 0.01 and
+            mean_rms > 0.01 and
+            prev_rms_end < 0.01 and
+            next_rms_start >= rms_end
+        ):
+            is_fade_in = True
+
+    # Add "Fades in" annotation
+    if is_fade_in:
+        fig.text(0.72, 0.05, "Fades in", fontsize=10, va='center', ha='left',
+                bbox=dict(facecolor='lightyellow', edgecolor='gray', boxstyle='round,pad=0.5'),
+                transform=fig.transFigure, clip_on=False)    
+
+
+
+    # Adjust layout and save
+    plt.subplots_adjust(right=0.7, hspace=0.3)
+    safe_note = mean_note.replace("#", "s")
+    image_filename = f"segment_{i}_{safe_note}.png"
+    filepath = os.path.join(output_folder, image_filename)
+    plt.savefig(filepath)
+    plt.close()
+    
+    
+
+# Output table to terminal
+df = pd.DataFrame(segment_data, columns=["Onset (SMPTE)", "Mean Note"])
+print("\nSegment Summary:")
+print(df.to_string(index=True))
+print(f"\nAll segment graphs saved to: {output_folder}")
+
+
+
+
+
+
+
+
+
+
+
+
+# Export CSV summary
+csv_output_path = f"{base_name}_summary.csv"
+
+def seconds_to_smpte(seconds, fps=30, subframes=80):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    frames = int((seconds * fps) % fps)
+    sub = int((seconds * fps * subframes) % subframes)
+    return f"{hours:02}:{minutes:02}:{secs:02}:{frames:02}.{sub:02}"
+
+csv_rows = []
+
+for i in range(len(onsets) - 1):
+    start = onsets[i]
+    end = onsets[i + 1]
+    duration = end - start
+    start_sample = int(start * sr)
+    end_sample = int(end * sr)
+    segment = y[start_sample:end_sample]
+
+    # Pitch detection
+    f0 = librosa.yin(segment, fmin=librosa.note_to_hz('C2'),
+                     fmax=librosa.note_to_hz('C7'), sr=sr)
+    f0 = f0[~np.isnan(f0)]
+    mean_freq = np.mean(f0) if len(f0) > 0 else 0
+    mean_note = hz_to_note(mean_freq)
+    max_dev = np.max(np.abs(f0 - mean_freq)) if len(f0) > 0 else 0
+
+    # Noise filtering logic
+    corrected_pitch = None
+    noise_label = "-"
+    if len(f0) > 4 and max_dev > 80:
+        rounded_f0 = np.round(f0).astype(int)
+        freq_counts = Counter(rounded_f0)
+        dominant_freq = freq_counts.most_common(1)[0][0]
+        cluster_mask = np.abs(f0 - dominant_freq) <= 5
+        f0_no_noise = f0[cluster_mask]
+
+        mean_freq_no_noise = np.mean(f0_no_noise) if len(f0_no_noise) > 0 else np.mean(f0)
+        mean_note_no_noise = hz_to_note(mean_freq_no_noise)
+
+        corrected_pitch = mean_note_no_noise
+        noise_label = "Noise"
+
+    # RMS
+    rms = librosa.feature.rms(y=segment, frame_length=2048, hop_length=512)[0]
+    mean_rms = np.mean(rms) if len(rms) > 0 else 0.0
+    rms_start = rms[0] if len(rms) > 0 else 0.0
+    rms_end = rms[-1] if len(rms) > 0 else 0.0
+
+    # Swell tendency
+    swell_tendency = int(np.sum(np.diff(f0))) if len(f0) > 1 else 0
+    swell_label = "Swell_up" if swell_tendency > 5 else "Swell_down" if swell_tendency < -5 else "-"
+
+    # Transition detection
+    is_transition = detect_transition_groups(f0)
+    delta_hz = float(np.max(f0) - np.min(f0)) if len(f0) > 0 else 0
+    delta_rms = float(rms_end - rms_start)
+
+    # Fade-in detection
+    is_fade_in = False
+    if i > 0 and i < len(onsets) - 2:
+        prev_segment = y[int(onsets[i - 1] * sr):int(onsets[i] * sr)]
+        prev_rms = librosa.feature.rms(y=prev_segment, frame_length=2048, hop_length=512)[0]
+        prev_rms_end = prev_rms[-1] if len(prev_rms) > 0 else 0.0
+
+        next_segment = y[int(onsets[i + 1] * sr):int(onsets[i + 2] * sr)]
+        next_rms = librosa.feature.rms(y=next_segment, frame_length=2048, hop_length=512)[0]
+        next_rms_start = next_rms[0] if len(next_rms) > 0 else 0.0
+
+        if (rms_start < 0.01 and mean_rms > 0.01 and
+            prev_rms_end < 0.01 and next_rms_start >= rms_end):
+            is_fade_in = True
+
+    # Silence condition
+    if mean_rms < 0.005:
+        mean_note = "S"
+        mean_freq_str = "-"
+        noise_label = "-"  # Don't flag noise if it's silence
+    else:
+        mean_freq_str = f"{mean_freq:.2f}"
+
+    # SMPTE
+    start_smpte = seconds_to_smpte(start)
+    end_smpte = seconds_to_smpte(end)
+
+    # Transition and fade labels
+    transition_label = "Transition" if is_transition else "-"
+    fade_label = "Fade_in" if is_fade_in else "-"
+
+    # Adjust values for Transition
+    if transition_label == "Transition":
+        mean_note = "T"
+        mean_freq_str = "-"
+        max_dev_str = "-"
+        delta_hz_str = "-"
+    else:
+        max_dev_str = "-" if mean_note in ["S", "T"] else f"{round(max_dev, 2)}"
+        delta_hz_str = "-" if mean_note in ["S", "T"] else f"{round(delta_hz, 2)}"
+
+    # Apply pitch correction if needed
+    if corrected_pitch and mean_note != "S":
+        if transition_label == "-":
+            mean_note = corrected_pitch
+            noise_label = "Pitch corrected"
+
+    # Append row
+    csv_rows.append([
+        i,                           # Seg_No
+        mean_note,                  # Pitch
+        f"{duration:.2f}",          # Duration
+        start_smpte,                # Start_Time
+        end_smpte,                  # End_Time
+        mean_freq_str,              # Mean_Hz
+        max_dev_str,                # Max_Hz_Dev
+        delta_hz_str,               # Transition_ΔHz
+        swell_tendency,             # Swell_Ten
+        swell_label,                # Swell
+        round(mean_rms, 6),         # Mean_RMS
+        round(rms_start, 6),        # RMS_Start
+        round(rms_end, 6),          # RMS_End
+        round(delta_rms, 6),        # Transition_ΔRMS
+        fade_label,                 # Is_FadeIn
+        transition_label,           # Is_Transition
+        noise_label                 # Noise
+    ])
+
+# Write CSV
+with open(csv_output_path, mode='w', newline='') as csv_file:
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow([
+        "Seg_No",
+        "Pitch",
+        "Duration",
+        "Start_Time",
+        "End_Time",
+        "Mean_Hz",
+        "Max_Hz_Dev",
+        "Transition_ΔHz",
+        "Swell_Ten",
+        "Swell",
+        "Mean_RMS",
+        "RMS_Start",
+        "RMS_End",
+        "Transition_ΔRMS",
+        "Is_FadeIn",
+        "Is_Transition",
+        "Noise"
+    ])
+    csv_writer.writerows(csv_rows)
+
+print(f"CSV summary saved to: {csv_output_path}")

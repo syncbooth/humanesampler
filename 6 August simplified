@@ -1,0 +1,356 @@
+import time
+start_time = time.time()
+import librosa
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+import csv
+
+def detect_onsets_with_threshold(y, sr, threshold_db=-50, frame_length=2048, hop_length=512):
+    rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+    rms_db = librosa.amplitude_to_db(rms, ref=np.max)
+    times = librosa.frames_to_time(np.arange(len(rms_db)), sr=sr, hop_length=hop_length)
+
+    onset_frames = librosa.onset.onset_detect(y=y, sr=sr, hop_length=hop_length, backtrack=True)
+    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop_length)
+
+    filtered_onsets = []
+    for t in onset_times:
+        idx = np.argmin(np.abs(times - t))
+        if rms_db[idx] >= threshold_db:
+            filtered_onsets.append(t)
+    return filtered_onsets
+
+def seconds_to_smpte(seconds, fps=30, subframes=80):
+    total_frames = seconds * fps
+    frame_number = int(total_frames)
+    fractional = total_frames - frame_number
+    subframe_number = int(fractional * subframes)
+
+    hours = frame_number // (fps * 60 * 60)
+    remainder = frame_number % (fps * 60 * 60)
+    minutes = remainder // (fps * 60)
+    remainder = remainder % (fps * 60)
+    secs = remainder // fps
+    frames = remainder % fps
+
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}:{frames:02d}.{subframe_number:02d}"
+
+def hz_to_note(freq):
+    if freq <= 0 or np.isnan(freq):
+        return "N/A"
+    note_number = 12 * np.log2(freq / 440.0) + 69
+    note_number = int(round(note_number))
+    note_names = ['C', 'C#', 'D', 'D#', 'E', 'F',
+                  'F#', 'G', 'G#', 'A', 'A#', 'B']
+    octave = note_number // 12 - 1
+    note = note_names[note_number % 12]
+    return f"{note}{octave}"
+
+
+# Load audio
+filename = 'Cello 1_closemic 44.wav'
+y, sr = librosa.load(filename, sr=None)
+
+# Detect onsets and prepend 0.0
+onsets = detect_onsets_with_threshold(y, sr)
+onsets = [0.0] + onsets
+audio_duration = librosa.get_duration(y=y, sr=sr)
+onsets.append(audio_duration)
+
+# Output folder
+base_name = os.path.splitext(filename)[0]
+output_folder = f"{base_name}_analysis"
+os.makedirs(output_folder, exist_ok=True)
+
+# Segment analysis
+segment_data = []
+previous_rms_end = None
+previous_last_f0 = None
+
+for i in range(len(onsets) - 1):
+    start = onsets[i]
+    end = onsets[i + 1]
+    start_sample = int(start * sr)
+    end_sample = int(end * sr)
+    segment = y[start_sample:end_sample]
+
+    # Pitch detection
+    # --- PITCH DETECTION AND NOISE JUMP FILTERING ---
+    f0_raw = librosa.yin(segment, fmin=librosa.note_to_hz('C2'),
+                        fmax=librosa.note_to_hz('C7'), sr=sr)
+    f0_raw = f0_raw[~np.isnan(f0_raw)]
+
+    # Generate original time vector
+    f0_time_raw = librosa.times_like(f0_raw, sr=sr)
+
+    # --- Noise Jump Detection ---
+    def find_noise_jumps(f0, big_jump=50, return_threshold=15):
+        noise_jump_indices = []
+        for i in range(1, len(f0) - 1):
+            prev_val = f0[i - 1]
+            curr_val = f0[i]
+            next_val = f0[i + 1]
+            if (
+                abs(curr_val - prev_val) > big_jump and
+                abs(next_val - prev_val) < return_threshold
+            ):
+                noise_jump_indices.append(i)
+        return noise_jump_indices
+
+    noise_jump_indices = find_noise_jumps(f0_raw)
+
+    # Remove noise jump indices from both f0 and time
+    if noise_jump_indices:
+        noise_jump_flag = "Yes"
+        f0 = np.delete(f0_raw, noise_jump_indices)
+        f0_time = np.delete(f0_time_raw, noise_jump_indices)
+    else:
+        noise_jump_flag = "No"
+        f0 = f0_raw
+        f0_time = f0_time_raw
+
+
+    # Calculate swell tendency
+    swell_tendency = np.sum(np.diff(f0)) if len(f0) > 1 else 0
+
+    # Hz transition from previous segment
+    if len(f0) > 0 and previous_last_f0 is not None:
+        hz_transition = round(abs(f0[0] - previous_last_f0), 2)
+    else:
+        hz_transition = 0.0
+
+    previous_last_f0 = f0[-1] if len(f0) > 0 else previous_last_f0
+
+    # RMS and note edge detection
+    rms = librosa.feature.rms(y=segment, frame_length=2048, hop_length=512)[0]
+    # note_edge_label = detect_note_edge_by_jump(f0, rms)
+
+    if len(rms) > 0 and previous_rms_end is not None:
+        rms_transition = round(abs(rms[0] - previous_rms_end), 4)
+    else:
+        rms_transition = 0.0
+
+    previous_rms_end = rms[-1] if len(rms) > 0 else previous_rms_end
+
+    # RMS start and end
+    rms_start = round(rms[0], 4) if len(rms) > 0 else 0.0
+    rms_end = round(rms[-1], 4) if len(rms) > 0 else 0.0
+
+    # Mean RMS value
+    mean_rms = round(np.mean(rms), 4) if len(rms) > 0 else 0.0   
+
+
+    # All Hz values
+    hz_int_values = [str(int(round(val))) for val in f0]
+    hz_values_str = ", ".join(hz_int_values)
+
+    mean_freq = np.mean(f0)
+    mean_note = hz_to_note(mean_freq)
+    smpte_time = seconds_to_smpte(start)
+
+
+    # Silence condition
+    if mean_rms < 0.001:
+        mean_note = "S"
+
+    if mean_rms < 0.001:
+        display_freq = "-"
+    else:
+        display_freq = str(round(mean_freq, 2))
+
+     # All Hz values
+    hz_int_values = [str(int(round(val))) for val in f0]
+    hz_values_str = ", ".join(hz_int_values)
+    
+
+    # --- NEW SUBSEGMENT LOGIC STARTS HERE ---
+    subsegments = []
+    jump_threshold = 20
+    jump_points = [0]
+
+    for i in range(1, len(f0)):
+        if abs(f0[i] - f0[i - 1]) >= jump_threshold:
+            jump_points.append(i)
+
+    jump_points.append(len(f0))
+
+    for j in range(len(jump_points) - 1):
+        j_start = jump_points[j]
+        j_end = jump_points[j + 1]
+        sub_f0 = f0[j_start:j_end]
+        if len(sub_f0) == 0:
+            continue
+
+        sub_name = f"J{j+1}"
+        sub_mean_hz = round(np.mean(sub_f0), 2)
+        sub_duration_ratio = round(((j_end - j_start) / len(f0)) * 100)
+        subsegments.append({
+            "name": sub_name,
+            "mean_hz": sub_mean_hz,
+            "percent": sub_duration_ratio,
+            "indice_start": j_start,
+            "indice_end":j_end,
+        })
+    # --- SUBSEGMENT LOGIC ENDS ---
+
+    # --- Detect all stable pitch areas in the segment ---
+    def find_stable_areas(f0, max_deviation=5, min_length=4):
+        stable_areas = []
+        n = len(f0)
+        start_idx = 0
+
+        while start_idx < n:
+            current_min = f0[start_idx]
+            current_max = f0[start_idx]
+            end_idx = start_idx
+
+            for i in range(start_idx + 1, n):
+                current_min = min(current_min, f0[i])
+                current_max = max(current_max, f0[i])
+                if current_max - current_min > max_deviation:
+                    break
+                end_idx = i
+
+            if (end_idx - start_idx + 1) >= min_length:
+                stable_areas.append((start_idx, end_idx))
+                start_idx = end_idx + 1
+            else:
+                start_idx += 1
+
+        return stable_areas
+    stable_areas = find_stable_areas(f0, max_deviation=15, min_length=3)
+    # --- Compute stable area durations and ratios ---
+    stable_area_durations = []
+    stable_area_percentages = []
+    segment_duration = f0_time[-1] - f0_time[0] if len(f0_time) > 1 else 0
+
+    for start_idx, end_idx in stable_areas:
+        start_time = f0_time[start_idx]
+        end_time = f0_time[end_idx]
+        duration = end_time - start_time
+        percentage = (duration / segment_duration * 100) if segment_duration > 0 else 0
+        stable_area_durations.append(round(duration, 3))
+        stable_area_percentages.append(round(percentage, 2))
+    # --- Mean Hz values for each stable area ---
+    stable_area_mean_hz = []
+    for start_idx, end_idx in stable_areas:
+        stable_slice = f0[start_idx:end_idx + 1]
+        if len(stable_slice) > 0:
+            stable_area_mean_hz.append(round(np.mean(stable_slice), 2))
+        else:
+            stable_area_mean_hz.append(None)    
+
+    # --- Note Details and Note Calculated ---
+    filtered_subs = []
+    for j, sub in enumerate(subsegments):
+        is_first = (j == 0)
+        is_last = (j == len(subsegments) - 1)
+        if is_first or is_last or sub["percent"] >= 5:
+            note = hz_to_note(sub["mean_hz"])
+            filtered_subs.append({
+                "name": sub["name"],
+                "note": note,
+                "percent": sub["percent"]
+            })
+
+    # Format Note Details string
+    note_details_parts = [f'{s["note"]} ({s["percent"]}%)' for s in filtered_subs]
+    note_details_str = " - ".join(note_details_parts)
+
+    # Determine Note Calculated
+    if len(filtered_subs) == 1:
+        note_calculated = filtered_subs[0]["note"]
+    elif len(filtered_subs) == 0:
+        note_calculated = "N/A"
+    else:
+        note_calculated = "Multiple Notes"
+
+
+    # --- Count stable areas per subsegment ---
+    swell_flag = ""
+    if len(subsegments) ==1:
+        sub = subsegments[0]
+        j_start = sub["indice_start"]
+        j_end = sub["indice_end"]
+
+        stable_inside_j = [
+            (s, e) for (s, e) in stable_areas
+            if s >= j_start and e <= j_end
+        ]
+        if len(stable_inside_j)>=2 and swell_tendency>5:
+            swell_flag = "Swell up"
+            # Find the stable area with the longest duration (highest percentage) and mean note of it.
+            longest_stable = max(stable_inside_j, key=lambda x: x[1] - x[0])
+            s_idx, e_idx = longest_stable
+            stable_mean = round(np.mean(f0[s_idx:e_idx + 1]), 2)
+            stable_note = librosa.hz_to_note(stable_mean)
+            note_calculated = stable_note
+        if len(stable_inside_j)>=2 and swell_tendency<-5:
+            swell_flag = "Swell down"         
+            # Find the stable area with the longest duration (highest percentage) and mean note of it.
+            longest_stable = max(stable_inside_j, key=lambda x: x[1] - x[0])
+            s_idx, e_idx = longest_stable
+            stable_mean = round(np.mean(f0[s_idx:e_idx + 1]), 2)
+            stable_note = librosa.hz_to_note(stable_mean)
+            note_calculated = stable_note
+
+
+
+
+# Append a dictionary with all relevant segment info
+    segment_data.append({
+        "Seg_no" : i,
+        "Smpte_time": smpte_time,
+        "Duration": round(segment_duration, 4),
+        "Note": mean_note,
+        "Note Calculated": note_calculated,
+        "Noise Jump": noise_jump_flag,
+        "Note Details": note_details_str,
+        "swell_tendency": int(round(swell_tendency)), 
+        "Swell": swell_flag,
+        "hz_transition": hz_transition,
+        "Mean_freq": display_freq,
+        "Mean_rms" : mean_rms,
+        "rms_start": rms_start,
+        "rms_end": rms_end,
+        "rms_transition": rms_transition,
+        "Subsegments": subsegments,
+        "Stable_areas": stable_areas,
+        "Stable_area_percentages": stable_area_percentages,
+        "Stable_area_mean_Hz": stable_area_mean_hz,
+        "Hz values" : hz_values_str,
+    })
+
+
+
+# CSV1
+
+
+csv_file = os.path.join(output_folder, f"{base_name}_csv1(simplified).csv")
+
+# Get all keys from the first dict to use as CSV headers
+if segment_data: 
+    column_to_remove = "Segment_no"  # Replace with the column name you want to delete
+    new_column_name = "Segment_No"       # New column to enumerate rows
+
+    for i, seg in enumerate(segment_data):
+        # Remove unwanted column if present
+        if column_to_remove in seg:
+            del seg[column_to_remove]
+
+        # Add new column with row number starting from 0
+        seg[new_column_name] = i
+
+    headers = [new_column_name] + [h for h in segment_data[0].keys() if h != new_column_name]
+
+    
+    with open(csv_file, mode='w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(segment_data)
+
+    print(f"CSV exported to {csv_file}")
+else:
+    print("No segment data to export.")

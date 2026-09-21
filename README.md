@@ -1,7 +1,11 @@
 HUMANE SAMPLER
+
 Functional Specification
+
 The product enables a music producer to transform a monophonic MIDI melody into a realistic audio performance played by real‑instrument samples. It achieves this by accepting two kinds of input: a bank of single‑note recordings taken from real instruments, and a melody expressed in MIDI. The system then selects, aligns and, when necessary, pitch‑shifts the recordings so that each MIDI note is rendered with the closest possible real‑world sample, finally exporting a single audio file together with a machine‑readable map of which recording landed at which moment in time.
+
 Sample ingestion
+
 The producer starts by uploading a single WAV recording—perhaps a scale, an improvisation or any uninterrupted performance—played on the instrument they wish to capture. Instead of requiring separate files for every pitch, the system analyses this long recording in five steps. First, it detects the onsets of individual notes. Secondly, it slices the audio at those onsets so that each note becomes its own fragment. Thirdly, it trims leading and trailing silence inside each fragment, ensuring the stored region contains only the useful sustain. Fourthly, it estimates the fundamental frequency of the fragment to determine its pitch. Finally, it stores the fragment on disk, tags it with the detected pitch and length and assigns a compact identifier. All fragments derived from the same source file are grouped into a collection representing that instrument. The producer can revisit any collection, inspect a grid that shows which of the thirty‑six target notes are covered, audition each fragment in the browser and, if desired, upload additional recordings to fill in missing notes.
 Melody input
 When the producer is ready to create a performance, they upload a monophonic MIDI file and choose one of the previously prepared instrument collections. The system reads every note event from the file, converting musical timing into absolute milliseconds so that each note is described with its pitch, start time and duration. For convenience the system also records the pitch of the previous and the next note, because that context later helps it choose the most suitable sample.
